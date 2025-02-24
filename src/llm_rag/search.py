@@ -4,7 +4,7 @@ import asyncio
 
 import lancedb
 import google.generativeai as genai
-from mcp import Server, Request, Response
+from mcp import server
 
 from .types import SearchResult
 
@@ -23,20 +23,37 @@ class SearchServer:
         self,
         query: str,
         limit: int = 10,
-        score_threshold: float = 0.0,
     ) -> list[SearchResult]:
         """Search for documents matching query.
         
         Args:
             query: Search query
             limit: Maximum number of results
-            score_threshold: Minimum similarity score
             
         Returns:
             List of search results
         """
-        # TODO: Implement hybrid search using Gemini embeddings and LanceDB
-        raise NotImplementedError
+        # Generate embedding for query using Gemini
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        model = 'models/text-embedding-004'
+        result = genai.embed_content(model=model, content=query, task_type="retrieval_query")
+        query_embedding = result['embedding']
+
+        # Perform vector search using LanceDB
+        results = self.table.search(query_embedding).limit(limit).to_list()
+
+        # Filter results based on score threshold and convert to SearchResult objects
+        search_results = [
+            SearchResult(
+                content=r['text'],
+                metadata={'url': r['url'], 'title': r['title']},
+                score=r['_distance'],
+                source=r['url']
+            )
+            for r in results
+        ]
+
+        return search_results
 
 async def handle_request(request: Request, server: SearchServer) -> Response:
     """Handle incoming search requests."""
@@ -46,16 +63,15 @@ async def handle_request(request: Request, server: SearchServer) -> Response:
             return Response({"error": "Missing query"}, status=400)
 
         limit = request.json.get("limit", 10)
-        score_threshold = request.json.get("score_threshold", 0.0)
 
-        results = await server.search(query, limit, score_threshold)
-        return Response({"results": [r.dict() for r in results]})
+        results = await server.search(query, limit)
+        return Response({"results": [r.model_dump() for r in results]})
     except Exception as e:
         return Response({"error": str(e)}, status=500)
 
 def main():
     parser = argparse.ArgumentParser(description="Run search server")
-    parser.add_argument("--db", required=True, help="Path to LanceDB database")
+    parser.add_argument("--db", default=".lancedb", help="Path to LanceDB database")
     parser.add_argument(
         "--table",
         default="documents",
@@ -78,7 +94,7 @@ def main():
     server = SearchServer(args.db, args.table)
 
     # Start MCP server
-    mcp_server = Server()
+    mcp_server = server.Server()
     mcp_server.handle("/search", lambda req: handle_request(req, server))
     asyncio.run(mcp_server.serve(args.host, args.port))
 

@@ -2,27 +2,22 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "fastapi",
-#     "langchain",
-#     "langchain-community",
-#     "langchain-openai",
-#     "numpy",
 #     "pydantic",
 #     "uvicorn",
 # ]
 # ///
+import os
+import json
+import logging
+
 from fastapi import FastAPI, Response, HTTPException, Header, Request, status
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-import os
-
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.text_splitter import CharacterTextSplitter
-
-import logging
+import google.generativeai as genai
+import lancedb
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -35,11 +30,6 @@ class TextBlob(BaseModel):
 class SearchTextRequest(BaseModel):
     text: str
     k: int
-
-
-# Initialize OpenAIEmbeddings
-embeddings = OpenAIEmbeddings()
-text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
 
 app = FastAPI()
 
@@ -77,32 +67,9 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content=jsonable_encoder({"detail": exc.errors(), "body": exc.body}),
     )
 
-
-@app.post("/add_texts/")
-async def add_texts(body: TextBlob, custom_header: str = Header(None)):
-    text = body.text
-    folder_path = "./faiss_index"
-    print(f"text: {text}")
-    texts = text_splitter.split_text(text)
-
-    # Load existing vector store from disk if it exists, else initialize a new FAISS vector store
-    if os.path.exists(folder_path):
-        faiss = FAISS.load_local(folder_path=folder_path, embeddings=embeddings)
-    else:
-        faiss = FAISS(
-            docstore=None,
-            embedding_function=lambda x: x,
-            index=None,
-            index_to_docstore_id=embeddings,
-        )  # Initialize FAISS with embeddings
-
-    # Add texts (either to the newly created or the loaded FAISS vector store)
-    faiss.add_texts(texts=texts)
-
-    faiss.save_local(folder_path=folder_path)
-
-    return {"message": "Text added successfully", "custom_header": custom_header}
-
+@app.get("/")
+async def root():
+    return {"message": "Welcome to TypingMind"}
 
 @app.post("/search_text/")
 async def search_text(request: SearchTextRequest):
@@ -110,13 +77,25 @@ async def search_text(request: SearchTextRequest):
     k = request.k
     logging.info(f"Received search_text request with text={text} and k={k}")
     try:
-        faiss = FAISS.load_local(folder_path="./faiss_index", embeddings=embeddings)
-        retriever = faiss.as_retriever(
-            search_type="mmr", search_kwargs={"k": k, "lambda_mult": 0.25}
-        )
+        # Generate embedding for query using Gemini
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        model = 'models/text-embedding-004'
+        result = genai.embed_content(model=model, content=text, task_type="retrieval_query")
+        query_embedding = result['embedding']
 
-        results = retriever.get_relevant_documents(text)
-        return {"matches": results}
+        # Perform vector search using LanceDB
+        db = lancedb.connect(".lancedb")
+        results = db['documents'].search(query_embedding).limit(k).to_list()
+
+        # Filter results based on score threshold and convert to SearchResult objects
+        return [
+                dict(
+                    content=r['text'],
+                    metadata={'title': r['title']},
+                    source=r['url']
+                )
+                for r in results
+            ]
     except Exception as e:
         logging.error(f"Error processing request: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
@@ -124,5 +103,4 @@ async def search_text(request: SearchTextRequest):
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, port=3033)
